@@ -1,0 +1,309 @@
+Rofi-cod/
+├── core/
+│   ├── __init__.py
+│   ├── identity.py
+│   ├── crypto.py
+│   ├── protocol.py
+│   └── tor_service.py
+├── client/
+│   ├── __init__.py
+│   ├── transport.py
+│   └── session.py
+├── main.py
+└── requirements.txt
+______________________________________
+import hashlib
+import hmac
+import socket
+import base64
+from typing import Tuple
+
+def get_local_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+def _validate_ipv4(ip: str) -> None:
+    parts = ip.split(".")
+    if len(parts) != 4:
+        raise ValueError(f"IP غير صحيح: {ip}")
+    for p in parts:
+        if not p.isdigit() or not (0 <= int(p) <= 255):
+            raise ValueError(f"IP غير صحيح: {ip}")
+
+def derive_key(shared_secret: bytes, info: bytes = b"p2p-id-v2") -> bytes:
+    if len(shared_secret) < 16:
+        raise ValueError("السر المشترك يجب أن يكون 16 بايت على الأقل")
+    salt = b"p2p-secure-salt-v2"
+    prk = hmac.new(salt, shared_secret, hashlib.sha256).digest()
+    return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+
+def encode_id_final(ip: str, port: int, shared_secret: bytes) -> str:
+    _validate_ipv4(ip)
+    if not (1 <= port <= 65535):
+        raise ValueError(f"المنفذ غير صحيح: {port}")
+    
+    octets = [int(x) for x in ip.split(".")]
+    packed = bytes(octets) + port.to_bytes(2, "big")
+    
+    enc_key = derive_key(shared_secret, info=b"p2p-enc-v3")
+    mac_key = derive_key(shared_secret, info=b"p2p-mac-v3")
+    
+    keystream = hashlib.sha256(enc_key + b"\x00\x00\x00\x00").digest()[:6]
+    encrypted = bytes(a ^ b for a, b in zip(packed, keystream))
+    
+    mac = hmac.new(mac_key, encrypted, hashlib.sha256).digest()[:8]
+    bundle = encrypted + mac
+    
+    return base64.b32encode(bundle).decode().rstrip("=").lower()
+
+def decode_id_final(short_id: str, shared_secret: bytes) -> Tuple[str, int]:
+    padded = short_id.upper()
+    while len(padded) % 8 != 0:
+        padded += "="
+    
+    bundle = base64.b32decode(padded)
+    if len(bundle) < 14:
+        raise ValueError("ID غير صالح")
+    
+    ciphertext = bundle[:6]
+    mac = bundle[6:14]
+    
+    mac_key = derive_key(shared_secret, info=b"p2p-mac-v3")
+    expected_mac = hmac.new(mac_key, ciphertext, hashlib.sha256).digest()[:8]
+    
+    if not hmac.compare_digest(mac, expected_mac):
+        raise ValueError("HMAC فشل — ID أو السر خاطئ")
+    
+    enc_key = derive_key(shared_secret, info=b"p2p-enc-v3")
+    keystream = hashlib.sha256(enc_key + b"\x00\x00\x00\x00").digest()[:6]
+    packed = bytes(a ^ b for a, b in zip(ciphertext, keystream))
+    
+    ip = ".".join(str(b) for b in packed[:4])
+    port = int.from_bytes(packed[4:6], "big")
+    
+    return ip, port
+_________________________________________________________
+
+import os
+import hashlib
+import hmac
+from nacl.secret import SecretBox
+from nacl.exceptions import CryptoError
+
+def derive_session_key(shared_secret: bytes, salt: bytes = b"") -> bytes:
+    info = b"p2p-session-key-v1"
+    prk = hmac.new(salt or b"p2p-salt-v1", shared_secret, hashlib.sha256).digest()
+    return hmac.new(prk, info, hashlib.sha256).digest()
+
+class SecureChannel:
+    def __init__(self, session_key: bytes, my_nonce_prefix: bytes = b""):
+        if len(session_key) != 32:
+            raise ValueError("مفتاح الجلسة يجب أن يكون 32 بايت")
+        self._box = SecretBox(session_key)
+        self._send_counter = 0
+        self._nonce_prefix = my_nonce_prefix or os.urandom(4)
+    
+    def encrypt(self, plaintext: bytes) -> bytes:
+        counter_bytes = self._send_counter.to_bytes(8, "big")
+        random_part = os.urandom(12)
+        nonce = self._nonce_prefix + counter_bytes + random_part
+        self._send_counter += 1
+        encrypted = self._box.encrypt(plaintext, nonce).ciphertext
+        return nonce + encrypted
+    
+    def decrypt(self, data: bytes) -> bytes:
+        if len(data) < 40:
+            raise ValueError("بيانات التشفير غير مكتملة")
+        nonce = data[:24]
+        ciphertext = data[24:]
+        return self._box.decrypt(ciphertext, nonce)
+
+_________________________________________________________
+import struct
+from enum import IntEnum
+
+MAGIC = b"P2P"
+PROTOCOL_VERSION = 1
+HEADER_SIZE = 16
+
+class MessageType(IntEnum):
+    TEXT = 0x10
+    CLOSE = 0x33
+
+def encode_header(msg_type: MessageType, length: int, seq: int) -> bytes:
+    return (
+        MAGIC +
+        PROTOCOL_VERSION.to_bytes(1, "big") +
+        int(msg_type).to_bytes(1, "big") +
+        length.to_bytes(4, "big") +
+        seq.to_bytes(7, "big")
+    )
+
+def decode_header(header: bytes) -> tuple[MessageType, int, int]:
+    if len(header) != HEADER_SIZE or header[0:3] != MAGIC:
+        raise ValueError("Header غير صالح")
+    msg_type = MessageType(header[4])
+    length = int.from_bytes(header[5:9], "big")
+    seq = int.from_bytes(header[9:16], "big")
+    return msg_type, length, seq
+
+_________________________________________________________
+from stem.control import Controller
+
+class TorManager:
+    def __init__(self, control_port: int = 9051):
+        self.control_port = control_port
+        self.controller = None
+        self.service_id = None
+
+    def start_onion_service(self, local_port: int = 5000) -> str:
+        try:
+            self.controller = Controller.from_port(port=self.control_port)
+            self.controller.authenticate()
+            res = self.controller.create_ephemeral_hidden_service(
+                {80: local_port}, key_type="NEW", key_content="ED25519-V3"
+            )
+            self.service_id = res.service_id
+            return f"{self.service_id}.onion"
+        except Exception:
+            return None
+
+    def stop(self):
+        if self.controller and self.service_id:
+            try:
+                self.controller.remove_ephemeral_hidden_service(self.service_id)
+            except Exception:
+                pass
+_________________________________________________________
+import asyncio
+from core.crypto import SecureChannel
+from core.protocol import HEADER_SIZE, MessageType, encode_header, decode_header
+
+class EncryptedTransport:
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, channel: SecureChannel):
+        self.reader = reader
+        self.writer = writer
+        self.channel = channel
+        self.seq = 1
+
+    async def send_message(self, text: str):
+        enc_payload = self.channel.encrypt(text.encode("utf-8"))
+        header = encode_header(MessageType.TEXT, len(enc_payload), self.seq)
+        self.seq += 1
+        self.writer.write(header + enc_payload)
+        await self.writer.drain()
+
+    async def read_message(self) -> str:
+        header_bytes = await self.reader.readexactly(HEADER_SIZE)
+        msg_type, length, _ = decode_header(header_bytes)
+        enc_payload = await self.reader.readexactly(length)
+        decrypted = self.channel.decrypt(enc_payload)
+        return decrypted.decode("utf-8")
+
+______________________________________
+import asyncio
+import os
+from core.identity import decode_id_final
+from core.crypto import derive_session_key, SecureChannel
+from client.transport import EncryptedTransport
+
+class PeerSession:
+    def __init__(self, shared_secret: bytes):
+        self.shared_secret = shared_secret
+
+    async def connect(self, peer_id: str) -> EncryptedTransport:
+        ip, port = decode_id_final(peer_id, self.shared_secret)
+        reader, writer = await asyncio.open_connection(ip, port)
+        
+        my_salt = os.urandom(16)
+        writer.write(my_salt)
+        await writer.drain()
+        
+        peer_salt = await reader.readexactly(16)
+        session_key = derive_session_key(self.shared_secret, my_salt + peer_salt)
+        channel = SecureChannel(session_key, my_nonce_prefix=b"\x01\x02\x03\x04")
+        
+        return EncryptedTransport(reader, writer, channel)
+
+    async def listen(self, port: int, callback):
+        async def handle(reader, writer):
+            peer_salt = await reader.readexactly(16)
+            my_salt = os.urandom(16)
+            writer.write(my_salt)
+            await writer.drain()
+            
+            session_key = derive_session_key(self.shared_secret, peer_salt + my_salt)
+            channel = SecureChannel(session_key, my_nonce_prefix=b"\x05\x06\x07\x08")
+            transport = EncryptedTransport(reader, writer, channel)
+            await callback(transport)
+
+        return await asyncio.start_server(handle, "0.0.0.0", port)
+
+______________________________________
+import asyncio
+import sys
+from core.identity import get_local_ip, encode_id_final
+from client.session import PeerSession
+
+SHARED_SECRET = b"my_super_secret_shared_key_32b!!"
+PORT = 5000
+
+async def handle_incoming(transport):
+    print("\n[+] تم اتصال صديقك بنجاح! تبادلا الرسائل الآن:")
+    asyncio.create_task(receiver(transport))
+    await sender(transport)
+
+async def receiver(transport):
+    try:
+        while True:
+            msg = await transport.read_message()
+            print(f"\n[صديقك]: {msg}\n[أنت]: ", end="")
+    except Exception:
+        print("\n[-] انقطع الاتصال.")
+
+async def sender(transport):
+    loop = asyncio.get_event_loop()
+    while True:
+        msg = await loop.run_in_executor(None, input, "[أنت]: ")
+        if msg.strip():
+            await transport.send_message(msg)
+
+async def main():
+    print("=== P2P Secure Chat ===")
+    role = input("اختر الدور (1 = خادم/Host, 2 = عميل/Connect): ").strip()
+    session = PeerSession(SHARED_SECRET)
+
+    if role == "1":
+        ip = get_local_ip()
+        my_id = encode_id_final(ip, PORT, SHARED_SECRET)
+        print(f"\n[+] الـ ID الخاص بك للشبكة المحلية: {my_id}")
+        print("[+] بانتظار اتصال صديقك...")
+        
+        server = await session.listen(PORT, handle_incoming)
+        async with server:
+            await server.serve_forever()
+
+    elif role == "2":
+        peer_id = input("أدخل الـ ID الخاص بصديقك: ").strip()
+        print("[+] جاري الاتصال...")
+        try:
+            transport = await session.connect(peer_id)
+            print("[+] تم الاتصال بنجاح!")
+            asyncio.create_task(receiver(transport))
+            await sender(transport)
+        except Exception as e:
+            print(f"[-] فشل الاتصال: {e}")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nتم الإغلاق.")
+
+______________________________________
+PyNaCl>=1.5.0
+stem>=1.8.0
