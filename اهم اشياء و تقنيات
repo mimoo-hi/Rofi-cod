@@ -1,0 +1,214 @@
+Import hashlib
+import base64
+from nacl.secret import SecretBox
+from nacl.utils import random
+
+def derive_id_key(shared_secret: bytes) -> bytes:
+    """اشتقاق مفتاح التشفير من السر المشترك"""
+    return hashlib.sha256(shared_secret + b"p2p_id_v1").digest()
+
+def ip_to_id(ip_address: str, shared_secret: bytes, port: int = 5000) -> str:
+    """
+    تحويل IP + Port إلى ID مشفر
+    مثال: 41.100.20.5 → 1a2a3a4a5a
+    """
+    # تجهيز البيانات
+    data = f"{ip_address}:{port}".encode()
+    
+    # اشتقاق المفتاح
+    key = derive_id_key(shared_secret)
+    box = SecretBox(key)
+    
+    # تشفير
+    nonce = random(SecretBox.NONCE_SIZE)
+    encrypted = box.encrypt(data, nonce).ciphertext
+    
+    # تحويل لـ Base32 وأخذ أول 10 أحرف
+    encoded = base64.b32encode(encrypted).decode().lower()
+    return encoded[:10]
+
+def id_to_ip(encoded_id: str, shared_secret: bytes) -> str:
+    """
+    فك تشفير ID لاستخراج IP
+    ملاحظة: نحتاج تخزين nonce أو استخدام nonce ثابت
+    """
+    # في التطبيق الحقيقي: nonce يُرسل مع ID أو يُشتق
+    # هذا مبسط للتوضيح
+    key = derive_id_key(shared_secret)
+    box = SecretBox(key)
+    
+    # إعادة بناء البيانات المشفرة (نحتاج padding)
+    padded = encoded_id.upper()
+    while len(padded) % 8 != 0:
+        padded += '='
+    
+    encrypted = base64.b32decode(padded)
+    
+    # فك التشفير (يحتاج nonce)
+    # decrypted = box.decrypt(nonce + encrypted)
+    # return decrypted.decode()
+----------
+def generate_short_id(ip: str, secret: bytes) -> str:
+    """توليد ID بصيغة 1a2a3a4a5a"""
+    # تشفير IP
+    key = derive_id_key(secret)
+    box = SecretBox(key)
+    nonce = random(SecretBox.NONCE_SIZE)
+    encrypted = box.encrypt(f"{ip}:5000".encode(), nonce).ciphertext
+    
+    # Base32 → أحرف صغيرة + أرقام
+    b32 = base64.b32encode(encrypted + nonce).decode().lower()
+    
+    # استبدال الأحرف لتشبه النمط المطلوب
+    result = ""
+    for i, c in enumerate(b32[:10]):
+        if i % 2 == 0:
+            # موقع زوجي: حرف
+            result += chr(ord('a') + (ord(c) % 26))
+        else:
+            # موقع فردي: رقم
+            result += str((ord(c) % 10))
+    
+    return result
+# مثال: 1a2a3a4a5a
+---------
+هيكل 
+p2p-secure/
+├── core/
+│   ├── protocol.h          # تعريف الرسائل (Header + Types)
+│   ├── crypto.c/.h         # libsodium wrappers (AES-GCM)
+│   ├── identity.c/.h       # توليد ID من IP
+│   └── tor_bridge.c/.h     # إدارة Tor Hidden Service
+│
+├── client-cpp/
+│   ├── main.cpp
+│   ├── transport.cpp       # Boost.Asio TCP + SSL
+│   ├── session.cpp         # إدارة الجلسة
+│   └── file_transfer.cpp   # إرسال ملفات كبيرة
+│
+├── client-python/
+│   ├── main.py
+│   ├── transport.py        # asyncio + ssl
+│   ├── session.py
+│   └── file_transfer.py
+│
+└── shared/
+    └── protocol_spec.md    # وثيقة البروتوكول
+--------
+برتكول رسائل 
+Header (16 بايت):
+┌──────────┬──────────┬──────────┬──────────┐
+│  Magic   │   Type   │  Length  │  Nonce   │
+│ (4)      │ (1)      │ (4)      │ (7)      │
+└──────────┴──────────┴──────────┴──────────┘
+
+Types:
+0x01 = HANDSHAKE       # تبادل مفاتيح
+0x02 = TEXT_MESSAGE    # رسالة نصية
+0x03 = FILE_START      # بداية ملف
+0x04 = FILE_CHUNK      # جزء ملف (64KB)
+0x05 = FILE_END        # نهاية ملف
+0x06 = ACK             # تأكيد
+0x07 = PING            # فحص
+0x08 = CLOSE           # إغلاق
+--------
+اعدد tor hidden سرفر
+# استخدام مكتبة stem للتحكم في Tor
+from stem.control import Controller
+from stem import Signal
+
+def create_onion_service(port: int = 5000):
+    """إنشاء Hidden Service برمجياً"""
+    with Controller.from_port(port=9051) as controller:
+        controller.authenticate()  # أو password
+        
+        # إنشاء خدمة جديدة
+        response = controller.create_ephemeral_hidden_service(
+            {port: port},
+            key_type='NEW',
+            key_content='ED25519-V3',
+            await_publication=True
+        )
+        
+        onion_address = response.service_id + ".onion"
+        print(f"Onion Address: {onion_address}")
+        
+        return onion_address
+--------
+ارسل ملفات 
+async def send_file(stream, box, filepath, chunk_size=64*1024):
+    """إرسال ملف كبير بدون تحميله كامل في الذاكرة"""
+    import os
+    
+    filesize = os.path.getsize(filepath)
+    filename = os.path.basename(filepath)
+    
+    # 1. إرسال معلومات الملف
+    await send_message(stream, box, 0x03, 
+                       f"{filename}|{filesize}")
+    
+    # 2. إرسال chunks
+    sent = 0
+    with open(filepath, 'rb') as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            
+            # تشفير كل chunk
+            nonce = random(SecretBox.NONCE_SIZE)
+            encrypted = box.encrypt(chunk, nonce).ciphertext
+            
+            # إرسال
+            header = struct.pack(">4sBI7s", b"P2P1", 0x04,
+                                 len(encrypted), nonce[:7])
+            stream.write(header + encrypted)
+            await stream.drain()
+            
+            sent += len(chunk)
+            print(f"\rProgress: {sent/filesize*100:.1f}%", end='')
+    
+    # 3. إرسال نهاية
+    await send_message(stream, box, 0x05, "EOF")
+---------
+حدف محادثة عند خروج
+// C: مسح آمن من الذاكرة
+#include <sodium.h>
+
+void secure_wipe(void *data, size_t len) {
+    sodium_memzero(data, len);  // لا يمكن تحسينه بعيداً بواسطة compiler
+}
+
+// في دالة الإغلاق
+void on_exit() {
+    for (int i = 0; i < message_count; i++) {
+        secure_wipe(messages[i].content, messages[i].length);
+        free(messages[i].content);
+    }
+    message_count = 0;
+    
+    // مسح المفاتيح
+    secure_wipe(session_key, 32);
+}
+--------
+توصية
+الميزة التقنية
+ID مشفر من IP AES-256 + Base32 (10 أحرف)
+Tor Onion stem library + ephemeral service
+النقل Boost.Asio TCP + OpenSSL TLS 1.3
+التشفير التطبيقي libsodium AES-256-GCM
+الملفات Chunks 64KB + SHA-256
+التخزين RAM فقط + sodium_memzero
+اللغات C/C++ (Boost.Asio) + Python (asyncio)
+------------
+خلاصة اخيرة
+خلاصة الحل
+
+طلبك قابل للتنفيذ بالكامل:
+
+1. الـ ID = IP مشفر بمفتاح مشترك → صيغة 1a2a3a4a5a
+2. الاتصال = TCP مباشر (إذا عندك IP عام) أو Tor Onion (يعمل في كل الحالات)
+3. التشفير = TLS 1.3 + AES-256-GCM (طبقتين)
+4. الملفات = Chunks 64KB مع SHA-256
+5. الخصوصية = كل شيء في RAM، حذف آمن عند الخروج
+----------
